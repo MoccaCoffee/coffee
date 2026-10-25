@@ -5,24 +5,45 @@ const email = process.env.IRCLOUD_EMAIL;
 const password = process.env.IRCLOUD_PASSWORD;
 if (!email || !password) throw new Error("Missing IRCLOUD_EMAIL or IRCLOUD_PASSWORD");
 
+const rawNetwork = process.env.IRCLOUD_NETWORK || "";
+if (!rawNetwork.trim()) throw new Error("Missing or empty IRCLOUD_NETWORK environment variable");
+const targetNetwork = rawNetwork.toLowerCase();
+
+const log = {
+  info: (...args) => console.log(`[${new Date().toLocaleTimeString()}]`, ...args),
+  warn: (...args) => console.warn(`[${new Date().toLocaleTimeString()}] [WARN]`, ...args)
+};
+
+let UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36";
+try {
+  const uaData = await fs.readFile("./ua.json", "utf-8");
+  const uaList = JSON.parse(uaData);
+  if (Array.isArray(uaList) && uaList.length > 0) {
+    UserAgent = uaList[Math.floor(Math.random() * uaList.length)];
+  }
+} catch (err) {
+  log.warn(`Could not load ua.json, using default fallback. Error: ${err.message}`);
+}
 
 async function login() {
   const tokenRes = await fetch("https://www.irccloud.com/chat/auth-formtoken", {
     method: "POST",
-    headers: { "content-length": "0" }
+    headers: { 
+      "content-length": "0",
+      "User-Agent": UserAgent
+    }
   });
   const token = await tokenRes.json();
   if (!tokenRes.ok || !token.success || !token.token) {
     throw new Error("Could not obtain IRCCloud auth token");
   }
 
-  const body = new URLSearchParams({
-    email, password, token: token.token
-  });
+  const body = new URLSearchParams({ email, password, token: token.token });
   const res = await fetch("https://www.irccloud.com/chat/login", {
     method: "POST",
     headers: {
       "content-type": "application/x-www-form-urlencoded",
+      "User-Agent": UserAgent,
       "x-auth-formtoken": token.token
     },
     body
@@ -36,10 +57,6 @@ async function login() {
     session: data.session,
     wsUrl: `wss://${data.websocket_host || "api.irccloud.com"}${data.websocket_path || "/"}`
   };
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function jsonLines(text) {
@@ -69,36 +86,70 @@ class IRCCloud {
     this.processingOob = false;
     this.queued = [];
     this.recentMessages = [];
+    this.backlogTimer = null;
+    this.statusListeners = new Set();
+    this.backlogResolve = null;
+    this.backlogReject = null;
   }
 
   async connect() {
     this.ws = new WebSocket(this.wsUrl, {
       headers: {
         Cookie: `session=${this.session}`,
-        Origin: "https://www.irccloud.com",
-        "User-Agent": "irccloud-keepalive/1.0"
+        Origin: "https://api.irccloud.com",
+        "User-Agent": UserAgent
       },
       perMessageDeflate: true
     });
 
+    this.ws.on("error", err => {
+      log.warn("WebSocket global error:", err.message);
+      if (this.backlogReject) {
+        if (this.backlogTimer) clearTimeout(this.backlogTimer);
+        this.backlogReject?.(err);
+        this.backlogReject = null;
+        this.backlogResolve = null;
+      }
+    });
+
     this.ws.on("message", data => {
-      for (const msg of jsonLines(data.toString())) this.handle(msg);
+      for (const msg of jsonLines(data.toString())) {
+        this.handle(msg).catch(e => log.warn("Error handling WS message:", e.message));
+      }
     });
 
     await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("WebSocket timeout")), 30000);
-      this.ws.once("open", () => { clearTimeout(timer); resolve(); });
-      this.ws.once("error", e => { clearTimeout(timer); reject(e); });
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error("WebSocket handshake timeout"));
+      }, 30000);
+
+      const onOpen = () => { cleanup(); resolve(); };
+      const onError = (e) => { cleanup(); reject(e); };
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.ws.off("open", onOpen);
+        this.ws.off("error", onError);
+      };
+
+      this.ws.once("open", onOpen);
+      this.ws.once("error", onError);
     });
 
     await new Promise((resolve, reject) => {
       this.backlogResolve = resolve;
       this.backlogReject = reject;
-      setTimeout(() => reject(new Error("Timed out loading IRCCloud state")), 45000);
+      
+      this.backlogTimer = setTimeout(() => {
+        this.backlogResolve = null;
+        this.backlogReject = null;
+        reject(new Error("Timed out loading IRCCloud state backlog"));
+      }, 30000);
     });
   }
 
-  handle(msg) {
+  async handle(msg) {
     if (msg._reqid && this.pending.has(msg._reqid)) {
       const p = this.pending.get(msg._reqid);
       this.pending.delete(msg._reqid);
@@ -109,28 +160,38 @@ class IRCCloud {
 
     if (msg.type === "oob_include") {
       this.processingOob = true;
-      const base = `https://${new URL(this.wsUrl).host}`;
+      const wsUrlObj = new URL(this.wsUrl);
+      const base = `https://${wsUrlObj.host}`;
       const backlogUrl = new URL(msg.url, base).href;
-      console.log(`Loading IRCCloud backlog from ${new URL(backlogUrl).pathname}`);
-      fetch(backlogUrl, {
-        headers: {
-          cookie: `session=${this.session}`,
-          "accept-encoding": "gzip, deflate"
-        }
-      })
-        .then(async r => {
-          if (!r.ok) throw new Error(`Backlog HTTP ${r.status}`);
-          return r.text();
-        })
-        .then(text => {
-          const items = jsonLines(text);
-          console.log(`Loaded ${items.length} backlog message(s).`);
-          for (const item of items) this.update(item);
-          this.processingOob = false;
-          for (const item of this.queued.splice(0)) this.update(item);
-          this.maybeReady();
-        })
-        .catch(e => this.backlogReject?.(e));
+      log.info(`Loading IRCCloud backlog from ${new URL(backlogUrl).pathname}`);
+      
+      try {
+        const r = await fetch(backlogUrl, {
+          headers: {
+            cookie: `session=${this.session}`,
+            "User-Agent": UserAgent,
+            "accept-encoding": "gzip, deflate"
+          }
+        });
+        if (!r.ok) throw new Error(`Backlog HTTP ${r.status}`);
+        
+        const text = await r.text();
+        const items = jsonLines(text);
+        log.info(`Loaded ${items.length} backlog message(s).`);
+        
+        for (const item of items) this.update(item);
+      } catch (e) {
+        if (this.backlogTimer) clearTimeout(this.backlogTimer);
+        const rejectFn = this.backlogReject;
+        this.backlogResolve = null;
+        this.backlogReject = null;
+        rejectFn?.(e);
+      } finally {
+        this.processingOob = false;
+        const currentQueue = this.queued.splice(0);
+        for (const item of currentQueue) this.update(item);
+        this.maybeReady();
+      }
       return;
     }
 
@@ -154,8 +215,14 @@ class IRCCloud {
       this.connections.set(cid, { ...(this.connections.get(cid) || {}), ...msg });
     }
     if (msg.type === "status_changed") {
-      const c = this.connections.get(Number(msg.cid));
-      if (c) c.status = msg.new_status;
+      const cid = Number(msg.cid);
+      const c = this.connections.get(cid);
+      if (c) {
+        c.status = msg.new_status;
+        for (const listener of this.statusListeners) {
+          listener(cid, msg.new_status);
+        }
+      }
     }
     if (msg.type === "makebuffer") this.buffers.set(Number(msg.bid), msg);
     if (msg.type === "backlog_complete") this.backlogDone = true;
@@ -163,7 +230,16 @@ class IRCCloud {
   }
 
   maybeReady() {
-    if (this.backlogDone && !this.processingOob) this.backlogResolve?.();
+    if (this.backlogDone && !this.processingOob) {
+      if (this.backlogTimer) {
+        clearTimeout(this.backlogTimer);
+        this.backlogTimer = null;
+      }
+      const resolveFn = this.backlogResolve;
+      this.backlogResolve = null;
+      this.backlogReject = null;
+      resolveFn?.();
+    }
   }
 
   rpc(method, data = {}, timeout = 20000) {
@@ -181,68 +257,70 @@ class IRCCloud {
     });
   }
 
-  async waitForStatus(cid, wanted, timeout = 60000) {
+  async waitForStatus(cid, wanted, timeout = 40000) {
     if (this.connections.get(cid)?.status === wanted) return;
-    const start = Date.now();
-    while (Date.now() - start < timeout) {
-      if (this.connections.get(cid)?.status === wanted) return;
-      await sleep(500);
-    }
-    throw new Error(`Connection ${cid} did not become ${wanted}`);
+    
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.statusListeners.delete(listener);
+        reject(new Error(`Connection ${cid} did not become ${wanted} (Timeout)`));
+      }, timeout);
+
+      const listener = (eventCid, status) => {
+        if (eventCid === cid && status === wanted) {
+          clearTimeout(timer);
+          this.statusListeners.delete(listener);
+          resolve();
+        }
+      };
+      this.statusListeners.add(listener);
+    });
   }
 
   close() {
-    try { this.ws?.close(); } catch {}
+    try { 
+      if (this.ws) {
+        if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
+          this.ws.close();
+        }
+        this.ws.removeAllListeners();
+      }
+    } catch {}
   }
 }
+try {
+  const auth = await login();
+  const client = new IRCCloud(auth.session, auth.wsUrl);
+  await client.connect();
+  
+  const target = [...client.connections.values()].find(c => {
+    const name = String(c.name || "").toLowerCase();
+    const hostname = String(c.hostname || "").toLowerCase();
+    return name.includes(targetNetwork) || hostname.includes(targetNetwork);
+  });
 
-const auth = await login();
-const client = new IRCCloud(auth.session, auth.wsUrl);
-await client.connect();
-
-const target = [...client.connections.values()].find(c =>
-  String(c.name || "").toLowerCase() === "undernet" &&
-  !String(c.name || "").includes(":")
-);
-
-if (!target) {
-  client.close();
-  throw new Error(
-    `Could not find the Undernet connection represented by "undernet". Available: ${[...client.connections.values()]
-      .map(c => `cid=${c.cid} ${c.name || ""} (${c.hostname || ""})`)
-      .join(", ") || "none"}`
-  );
-}
-
-const cid = Number(target.cid);
-console.log(`Undernet connection cid=${cid}, status=${target.status}`);
-
-if (!["connected_ready", "connected", "connected_joining"].includes(target.status)) {
-  console.log("Reconnecting Undernet...");
-  await client.rpc("reconnect", { cid });
-  await client.waitForStatus(cid, "connected_ready");
-}
-
-console.log("Sending hi to CoachHardy...");
-await client.rpc("say", { cid, to: "CoachHardy", msg: "hi" });
-
-await sleep(1000);
-
-const buffer = [...client.buffers.values()].find(b =>
-  Number(b.cid) === cid &&
-  b.buffer_type === "conversation" &&
-  String(b.name || "").toLowerCase() === "coachhardy"
-);
-
-if (buffer?.bid) {
-  try {
-    await client.rpc("archive-buffer", { cid, id: Number(buffer.bid) });
-    console.log("Archived PM buffer.");
-  } catch (e) {
-    console.warn("Message succeeded; buffer archive failed:", e.message);
+  if (!target) {
+    client.close();
+    throw new Error(
+      `Could not find the connection. Available: ${[...client.connections.values()]
+        .map(c => `cid=${c.cid} ${c.name || "unnamed"} (${c.hostname || ""})`)
+        .join(", ") || "none"}`
+    );
   }
-}
 
+  const cid = Number(target.cid);
+  log.info(`Connection cid=${cid}, status=${target.status}`);
+
+  if (target.status !== "connected_ready") {
+    log.info("Ensuring network is connected_ready...");
+    if (!["connected", "connected_joining"].includes(target.status)) {
+      await client.rpc("reconnect", { cid });
+    }
+    await client.waitForStatus(cid, "connected_ready");
+  }
 client.close();
-
-console.log("IRCCloud keepalive completed successfully.");
+    log.info("Keepalive completed successfully.");
+} catch (error) {
+    log.warn(`Automation execution failed: ${error.message}`);
+process.exit(1);
+}
